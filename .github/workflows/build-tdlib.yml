@@ -1,0 +1,349 @@
+name: Build TDLib Prebuilts
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to publish (e.g. tdlib-1.8.70-r1)'
+        required: false
+        default: 'tdlib-1.8.70-r1'
+      tdlib_commit:
+        description: 'TDLib commit SHA'
+        required: false
+        default: '03220f6b3043c6fd7785fbf0901d63f19ad19974'
+      openssl_version:
+        description: 'OpenSSL version'
+        required: false
+        default: '3.4.1'
+
+env:
+  TDLIB_COMMIT: ${{ github.event.inputs.tdlib_commit || '03220f6b3043c6fd7785fbf0901d63f19ad19974' }}
+  OPENSSL_VERSION: ${{ github.event.inputs.openssl_version || '3.4.1' }}
+  RELEASE_TAG: ${{ github.event.inputs.release_tag || 'tdlib-1.8.70-r1' }}
+
+permissions:
+  contents: write
+
+jobs:
+  build-android:
+    name: Android (${{ matrix.abi }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gperf libssl-dev zlib1g-dev ninja-build php-cli binutils
+
+      - name: Setup Android NDK r27c
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+          add-to-path: false
+
+      - name: Clone TDLib pinned commit
+        run: |
+          git init td
+          git -C td remote add origin https://github.com/tdlib/td.git
+          git -C td fetch --depth 1 origin "${TDLIB_COMMIT}"
+          git -C td checkout FETCH_HEAD
+
+      - name: Build OpenSSL ${{ env.OPENSSL_VERSION }} static for ${{ matrix.abi }} (API 23)
+        shell: bash
+        run: |
+          set -euo pipefail
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          export ANDROID_NDK_ROOT="$NDK"
+          export PATH="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+
+          curl -sSL "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" -o openssl.tar.gz
+          tar xzf openssl.tar.gz
+          cd "openssl-${OPENSSL_VERSION}"
+
+          PREFIX="$GITHUB_WORKSPACE/openssl-out/${{ matrix.abi }}"
+          mkdir -p "$PREFIX/lib" "$PREFIX/include"
+
+          if [ "${{ matrix.abi }}" = "arm64-v8a" ]; then
+            export LDFLAGS="-Wl,-z,max-page-size=16384"
+            ./Configure android-arm64 no-shared no-apps no-tests no-docs -U__ANDROID_API__ -D__ANDROID_API__=23
+          else
+            ./Configure android-arm no-shared no-apps no-tests no-docs -U__ANDROID_API__ -D__ANDROID_API__=23 -D__ARM_MAX_ARCH__=8
+          fi
+
+          sed -i 's/-O3/-O3 -ffunction-sections -fdata-sections/g' Makefile
+          make -j"$(nproc)" build_libs
+          cp libcrypto.a libssl.a "$PREFIX/lib/"
+          cp -R include/openssl "$PREFIX/include/"
+
+      - name: Generate host TL sources & build libtdjson.so (${{ matrix.abi }})
+        shell: bash
+        run: |
+          set -euo pipefail
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          OPENSSL_PREFIX="$GITHUB_WORKSPACE/openssl-out/${{ matrix.abi }}"
+
+          mkdir -p td/example/android/build-native-JSON
+          pushd td/example/android/build-native-JSON
+          cmake -DTD_ANDROID_JSON=ON -DTD_GENERATE_SOURCE_FILES=ON -GNinja ..
+          cmake --build .
+          popd
+
+          EXTRA_LINK=""
+          if [ "${{ matrix.abi }}" = "arm64-v8a" ]; then
+            EXTRA_LINK="-DCMAKE_SHARED_LINKER_FLAGS=-Wl,-z,max-page-size=16384"
+          fi
+
+          mkdir -p "build-${{ matrix.abi }}"
+          pushd "build-${{ matrix.abi }}"
+          cmake \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DOPENSSL_ROOT_DIR="$OPENSSL_PREFIX" \
+            -DOPENSSL_INCLUDE_DIR="$OPENSSL_PREFIX/include" \
+            -DOPENSSL_CRYPTO_LIBRARY="$OPENSSL_PREFIX/lib/libcrypto.a" \
+            -DOPENSSL_SSL_LIBRARY="$OPENSSL_PREFIX/lib/libssl.a" \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -GNinja \
+            -DANDROID_ABI="${{ matrix.abi }}" \
+            -DANDROID_STL=c++_static \
+            -DANDROID_PLATFORM=android-23 \
+            -DTD_ENABLE_PCH=ON \
+            -DTD_ANDROID_JSON=ON \
+            $EXTRA_LINK \
+            ../td/example/android
+          cmake --build . --target tdjson -j"$(nproc)"
+
+          STRIP="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          READELF="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          OUT_DIR="$GITHUB_WORKSPACE/out/${{ matrix.abi }}"
+          mkdir -p "$OUT_DIR"
+          "$STRIP" --strip-debug --strip-unneeded td/libtdjson.so -o "$OUT_DIR/libtdjson.so"
+          "$READELF" -l "$OUT_DIR/libtdjson.so" | grep -E "LOAD|align"
+          ls -lh "$OUT_DIR/libtdjson.so"
+          popd
+
+          tar -C "$GITHUB_WORKSPACE/out/${{ matrix.abi }}" -czf "$GITHUB_WORKSPACE/tdjson-android-${{ matrix.abi }}.tar.gz" libtdjson.so
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tdjson-android-${{ matrix.abi }}
+          path: tdjson-android-${{ matrix.abi }}.tar.gz
+
+  build-windows:
+    name: Windows (x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone TDLib pinned commit
+        shell: pwsh
+        run: |
+          git init td
+          git -C td remote add origin https://github.com/tdlib/td.git
+          git -C td fetch --depth 1 origin "${{ env.TDLIB_COMMIT }}"
+          git -C td checkout FETCH_HEAD
+
+      - name: Install OpenSSL & zlib via vcpkg (x64-windows-static-md)
+        shell: pwsh
+        run: |
+          $vcpkgExe = Join-Path $env:VCPKG_INSTALLATION_ROOT "vcpkg.exe"
+          & $vcpkgExe install openssl:x64-windows-static-md zlib:x64-windows-static-md
+
+      - name: Build tdjson.dll
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vcpkgToolchain = Join-Path $env:VCPKG_INSTALLATION_ROOT "scripts/buildsystems/vcpkg.cmake"
+          cmake -S td -B build-win -G "Visual Studio 17 2022" -A x64 `
+            "-DCMAKE_TOOLCHAIN_FILE=$vcpkgToolchain" `
+            "-DVCPKG_TARGET_TRIPLET=x64-windows-static-md" `
+            "-DOPENSSL_USE_STATIC_LIBS=TRUE" `
+            "-DTD_ENABLE_LTO=OFF"
+          cmake --build build-win --target tdjson --config Release -j
+          $dll = Get-ChildItem -Path build-win -Filter "tdjson.dll" -Recurse | Select-Object -First 1
+          if (-not $dll) { throw "tdjson.dll not found in build-win" }
+          New-Item -ItemType Directory -Force -Path out/windows-x64 | Out-Null
+          Copy-Item $dll.FullName out/windows-x64/tdjson.dll -Force
+          Compress-Archive -Path out/windows-x64/tdjson.dll -DestinationPath tdjson-windows-x64.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tdjson-windows-x64
+          path: tdjson-windows-x64.zip
+
+  build-apple:
+    name: macOS (arm64) & iOS (xcframework)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install gperf
+        run: brew install gperf
+
+      - name: Clone TDLib pinned commit
+        run: |
+          git init td
+          git -C td remote add origin https://github.com/tdlib/td.git
+          git -C td fetch --depth 1 origin "${TDLIB_COMMIT}"
+          git -C td checkout FETCH_HEAD
+
+      - name: Build OpenSSL ${{ env.OPENSSL_VERSION }} static (macOS arm64, iOS OS arm64, iOS Simulator arm64)
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sSL "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" -o openssl.tar.gz
+
+          build_openssl() {
+            local name="$1"
+            local target="$2"
+            local sdk="$3"
+            local minflag="$4"
+            rm -rf "openssl-${OPENSSL_VERSION}"
+            tar xzf openssl.tar.gz
+            pushd "openssl-${OPENSSL_VERSION}"
+            local sysroot
+            sysroot="$(xcrun --sdk "$sdk" --show-sdk-path)"
+            export CROSS_TOP="$(dirname "$(dirname "$sysroot")")"
+            export CROSS_SDK="$(basename "$sysroot")"
+            export CC="$(xcrun --sdk "$sdk" -f clang) -isysroot $sysroot $minflag"
+            ./Configure "$target" no-shared no-apps no-tests no-docs --prefix="$GITHUB_WORKSPACE/openssl-$name"
+            make -j"$(sysctl -n hw.ncpu)" build_libs
+            mkdir -p "$GITHUB_WORKSPACE/openssl-$name/lib" "$GITHUB_WORKSPACE/openssl-$name/include"
+            cp libcrypto.a libssl.a "$GITHUB_WORKSPACE/openssl-$name/lib/"
+            cp -R include/openssl "$GITHUB_WORKSPACE/openssl-$name/include/"
+            popd
+          }
+
+          # Host macOS arm64
+          rm -rf "openssl-${OPENSSL_VERSION}"
+          tar xzf openssl.tar.gz
+          pushd "openssl-${OPENSSL_VERSION}"
+          ./Configure darwin64-arm64-cc no-shared no-apps no-tests no-docs -mmacosx-version-min=12.0 --prefix="$GITHUB_WORKSPACE/openssl-macos"
+          make -j"$(sysctl -n hw.ncpu)" build_libs
+          mkdir -p "$GITHUB_WORKSPACE/openssl-macos/lib" "$GITHUB_WORKSPACE/openssl-macos/include"
+          cp libcrypto.a libssl.a "$GITHUB_WORKSPACE/openssl-macos/lib/"
+          cp -R include/openssl "$GITHUB_WORKSPACE/openssl-macos/include/"
+          popd
+
+          # iOS device arm64
+          build_openssl "ios-os" "ios64-xcrun" "iphoneos" "-miphoneos-version-min=15.0"
+
+          # iOS simulator arm64
+          build_openssl "ios-sim" "iossimulator-arm64-xcrun" "iphonesimulator" "-mios-simulator-version-min=15.0"
+
+      - name: Build macOS libtdjson.dylib
+        shell: bash
+        run: |
+          set -euo pipefail
+          OPENSSL_PREFIX="$GITHUB_WORKSPACE/openssl-macos"
+          mkdir -p build-macos
+          pushd build-macos
+          cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
+            -DOPENSSL_FOUND=TRUE \
+            -DOPENSSL_INCLUDE_DIR="$OPENSSL_PREFIX/include" \
+            -DOPENSSL_CRYPTO_LIBRARY="$OPENSSL_PREFIX/lib/libcrypto.a" \
+            -DOPENSSL_SSL_LIBRARY="$OPENSSL_PREFIX/lib/libssl.a" \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/install-macos" \
+            ../td
+          cmake --build . --target tdjson -j"$(sysctl -n hw.ncpu)"
+          DYLIB="$(find . -maxdepth 3 -name 'libtdjson*.dylib' -not -type l | head -n 1)"
+          mkdir -p "$GITHUB_WORKSPACE/out/macos"
+          cp "$DYLIB" "$GITHUB_WORKSPACE/out/macos/libtdjson.dylib"
+          install_name_tool -id "@rpath/libtdjson.dylib" "$GITHUB_WORKSPACE/out/macos/libtdjson.dylib"
+          strip -x "$GITHUB_WORKSPACE/out/macos/libtdjson.dylib"
+          otool -L "$GITHUB_WORKSPACE/out/macos/libtdjson.dylib"
+          popd
+          tar -C "$GITHUB_WORKSPACE/out/macos" -czf "$GITHUB_WORKSPACE/tdjson-macos.tar.gz" libtdjson.dylib
+
+      - name: Generate host TL sources & Build iOS tdjson.xcframework
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Host codegen needed when cross-compiling for iOS
+          mkdir -p build-macos-codegen
+          pushd build-macos-codegen
+          cmake -DTD_GENERATE_SOURCE_FILES=ON \
+            -DOPENSSL_FOUND=TRUE \
+            -DOPENSSL_INCLUDE_DIR="$GITHUB_WORKSPACE/openssl-macos/include" \
+            -DOPENSSL_CRYPTO_LIBRARY="$GITHUB_WORKSPACE/openssl-macos/lib/libcrypto.a" \
+            -DOPENSSL_SSL_LIBRARY="$GITHUB_WORKSPACE/openssl-macos/lib/libssl.a" \
+            ../td
+          cmake --build . -j"$(sysctl -n hw.ncpu)"
+          popd
+
+          build_ios_slice() {
+            local name="$1"
+            local platform="$2"
+            local ossl="$3"
+            mkdir -p "build-$name" "slice-$name"
+            pushd "build-$name"
+            cmake \
+              -DIOS_PLATFORM="$platform" \
+              -DIOS_ARCH=arm64 \
+              -DIOS_DEPLOYMENT_TARGET=15.0 \
+              -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/td/CMake/iOS.cmake" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DOPENSSL_FOUND=TRUE \
+              -DOPENSSL_INCLUDE_DIR="$ossl/include" \
+              -DOPENSSL_CRYPTO_LIBRARY="$ossl/lib/libcrypto.a" \
+              -DOPENSSL_SSL_LIBRARY="$ossl/lib/libssl.a" \
+              ../td
+            cmake --build . --target tdjson -j"$(sysctl -n hw.ncpu)"
+            local dylib
+            dylib="$(find . -maxdepth 3 -name 'libtdjson*.dylib' -not -type l | head -n 1)"
+            cp "$dylib" "../slice-$name/libtdjson.dylib"
+            install_name_tool -id "@rpath/libtdjson.dylib" "../slice-$name/libtdjson.dylib"
+            strip -x "../slice-$name/libtdjson.dylib" || true
+            popd
+          }
+
+          build_ios_slice "ios-os" "OS" "$GITHUB_WORKSPACE/openssl-ios-os"
+          build_ios_slice "ios-sim" "SIMULATOR" "$GITHUB_WORKSPACE/openssl-ios-sim"
+
+          mkdir -p "$GITHUB_WORKSPACE/out/ios"
+          xcodebuild -create-xcframework \
+            -library "$GITHUB_WORKSPACE/slice-ios-os/libtdjson.dylib" \
+            -library "$GITHUB_WORKSPACE/slice-ios-sim/libtdjson.dylib" \
+            -output "$GITHUB_WORKSPACE/out/ios/tdjson.xcframework"
+          cd "$GITHUB_WORKSPACE/out/ios"
+          zip -r -y -q "$GITHUB_WORKSPACE/tdjson-ios-xcframework.zip" tdjson.xcframework
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tdjson-apple
+          path: |
+            tdjson-macos.tar.gz
+            tdjson-ios-xcframework.zip
+
+  publish-release:
+    needs: [build-android, build-windows, build-apple]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate manifest.json with SHA-256 checksums
+        run: |
+          python3 scripts/generate_manifest.py dist "${RELEASE_TAG}" "${TDLIB_COMMIT}"
+          cat dist/manifest.json
+
+      - name: Create GitHub Release ${{ env.RELEASE_TAG }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${RELEASE_TAG}" dist/* \
+            --title "TDLib Prebuilts ${RELEASE_TAG}" \
+            --notes "Prebuilt clean-room TDLib C JSON libraries (BSL-1.0) statically linked with OpenSSL ${OPENSSL_VERSION} (Apache-2.0) for Android, Windows, macOS, and iOS." \
+            --latest
