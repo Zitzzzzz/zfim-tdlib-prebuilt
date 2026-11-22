@@ -148,9 +148,15 @@ jobs:
           git -C td fetch --depth 1 origin "${{ env.TDLIB_COMMIT }}"
           git -C td checkout FETCH_HEAD
 
-      - name: Install OpenSSL & zlib via vcpkg (x64-windows-static-md)
+      - name: Setup MSVC x64 & Ninja
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: Install OpenSSL, zlib & Ninja via vcpkg / choco
         shell: pwsh
         run: |
+          choco install ninja -y --no-progress
           $vcpkgExe = Join-Path $env:VCPKG_INSTALLATION_ROOT "vcpkg.exe"
           & $vcpkgExe install openssl:x64-windows-static-md zlib:x64-windows-static-md
 
@@ -159,12 +165,13 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $vcpkgToolchain = Join-Path $env:VCPKG_INSTALLATION_ROOT "scripts/buildsystems/vcpkg.cmake"
-          cmake -S td -B build-win -G "Visual Studio 17 2022" -A x64 `
+          cmake -S td -B build-win -G "Ninja" `
+            "-DCMAKE_BUILD_TYPE=Release" `
             "-DCMAKE_TOOLCHAIN_FILE=$vcpkgToolchain" `
             "-DVCPKG_TARGET_TRIPLET=x64-windows-static-md" `
             "-DOPENSSL_USE_STATIC_LIBS=TRUE" `
             "-DTD_ENABLE_LTO=OFF"
-          cmake --build build-win --target tdjson --config Release -j
+          cmake --build build-win --target tdjson -j
           $dll = Get-ChildItem -Path build-win -Filter "tdjson.dll" -Recurse | Select-Object -First 1
           if (-not $dll) { throw "tdjson.dll not found in build-win" }
           New-Item -ItemType Directory -Force -Path out/windows-x64 | Out-Null
